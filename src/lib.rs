@@ -1,13 +1,21 @@
 use std::collections::HashMap;
 
+use extism_pdk::{plugin_fn, FnResult, Json};
 use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest};
 use urlencoding::encode;
 
+#[plugin_fn]
+pub fn infos() -> FnResult<Json<PluginInformation>> {
+    Ok(Json(
+        infos_internal()
+    ))
+}
 
-pub fn infos() -> PluginInformation {
+
+pub fn infos_internal() -> PluginInformation {
     PluginInformation { 
         name: "pcloud".into(), 
-        capabilities: vec![PluginType::Lookup, PluginType::Request], 
+        capabilities: vec![PluginType::Provider], 
         version: 1, 
         interface_version: 1, 
         publisher: "neckaros".into(), 
@@ -16,7 +24,7 @@ pub fn infos() -> PluginInformation {
             CustomParam { name: "client_id".to_owned(), param: CustomParamTypes::Text(None), description: Some("You can provide your own clientid and client secret if you wish".to_owned()), required:false },
             CustomParam { name: "client_secret".to_owned(), param: CustomParamTypes::Text(None), description: Some("You can provide your own clientid and client secret if you wish".to_owned()), required:false }
         ],
-        credential_kind: Some(CredentialType::Oauth { url: "https://my.pcloud.com/oauth2/authorize?response_type=code&client_id=${clientid}&state=&redirect_uri=#redirecturi#".to_owned() }), 
+        credential_kind: Some(CredentialType::Oauth { url: format!("https://my.pcloud.com/oauth2/authorize?response_type=code&client_id={}&state=#state#&redirect_uri=#redirecturi#", "4zSGTdUSUBV") }), 
         ..Default::default() }
 
 }
