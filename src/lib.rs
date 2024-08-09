@@ -1,9 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use extism_pdk::{plugin_fn, FnResult, Json};
-use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest};
+use extism_pdk::{Error, WithReturnCode};
+use extism_pdk::{error, http, info, log, plugin_fn, warn, FnResult, HttpRequest, Json};
+use interfaces::{PCloudCredentialsSettings, PCloudErrorResponse, PCloudSettings, TokenResponse};
+use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest, RsPluginRequest};
+use serde::Deserialize;
+use serde_json::{json, Value};
 use urlencoding::encode;
-
+pub mod interfaces;
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
@@ -11,8 +15,11 @@ pub fn infos() -> FnResult<Json<PluginInformation>> {
     ))
 }
 
+pub static DEFAULT_CLIENT_ID: &str = "4zSGTdUSUBV";
+pub static DEFAULT_CLIENT_SECRET: &str = "uoUSvu8YcxXzb2iRGssdhyuFr9sk";
 
 pub fn infos_internal() -> PluginInformation {
+    warn!("VALUESTY");
     PluginInformation { 
         name: "pcloud".into(), 
         capabilities: vec![PluginType::Provider], 
@@ -24,9 +31,31 @@ pub fn infos_internal() -> PluginInformation {
             CustomParam { name: "client_id".to_owned(), param: CustomParamTypes::Text(None), description: Some("You can provide your own clientid and client secret if you wish".to_owned()), required:false },
             CustomParam { name: "client_secret".to_owned(), param: CustomParamTypes::Text(None), description: Some("You can provide your own clientid and client secret if you wish".to_owned()), required:false }
         ],
-        credential_kind: Some(CredentialType::Oauth { url: format!("https://my.pcloud.com/oauth2/authorize?response_type=code&client_id={}&state=#state#&redirect_uri=#redirecturi#", "4zSGTdUSUBV") }), 
+        credential_kind: Some(CredentialType::Oauth { url: format!("https://my.pcloud.com/oauth2/authorize?response_type=code&client_id={}&state=#state#&redirect_uri=#redirecturi#", DEFAULT_CLIENT_ID) }), 
         ..Default::default() }
 
+}
+
+pub fn settings_from_value(value: Value)-> FnResult<PCloudSettings> {
+    let user_settings: PCloudSettings = serde_json::from_value(value).map_err(|e| {
+        error!("Error deserializing settings: {:?}", e);
+        Error::msg("Unable to deserialize settings")
+})?;
+
+    Ok(user_settings)
+}
+
+pub fn parse_credentials_settings(value: Value)-> FnResult<PCloudCredentialsSettings> {
+    let cred_settings: PCloudCredentialsSettings = serde_json::from_value(value).map_err(|e| {
+        error!("Error deserializing credentials settings: {:?}", e);
+        Error::msg("Unable to deserialize credentials settings")
+})?;
+
+    Ok(cred_settings)
+}
+
+pub fn get_oauth_url(settings: PCloudSettings) -> String {
+    format!("https://my.pcloud.com/oauth2/authorize?response_type=code&client_id={}&state=#state#&redirect_uri=#redirecturi#", settings.client_id)
 }
 
 pub fn get_base_url(credential: &PluginCredential) -> String {
@@ -46,34 +75,112 @@ pub fn get_url(path: String, credential: &PluginCredential, params: HashMap<&str
     }
 }
 
+#[plugin_fn]
+pub fn exchange_token(Json(settings): Json<RsPluginRequest<HashMap<String, String>>>) -> FnResult<Json<PluginCredential>> {
+    let code = settings.request.get("code").ok_or(Error::msg("No code provided"))?;
+    let hostname = settings.request.get("hostname").ok_or(Error::msg("No hostname provided"))?;
+    let locationid = settings.request.get("locationid").ok_or(Error::msg("No hostname provided"))?;
+    let plugin_settings = settings_from_value(settings.plugin_settings)?;
 
-pub fn exchange_token(code: &str, client_id: &str, client_secret: &str) -> FnResult<PluginCredential> {
+    let cred_settings = PCloudCredentialsSettings {
+        hostname: hostname.to_string(),
+        locationid: locationid.to_string()
+    };
+
+    info!("Token Code: {:?}", code);
+    let result = exchange_token_internal(hostname, code, DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET)?;
+
+    let cred = PluginCredential {
+        kind: CredentialType::Oauth { url: get_oauth_url(plugin_settings) },
+        login: None,
+        password: Some(result.access_token),
+        settings: json!(cred_settings),
+        refresh_token: None,
+        expires: None,
+        ..Default::default()
+    };
+    Ok(Json(cred))
+}
+
+fn exchange_token_internal(hostname: &str, code: &str, client_id: &str, client_secret: &str) -> FnResult<TokenResponse> {
+    let url = format!("https://{}/oauth2_token?client_id={}&client_secret={}&code={}", hostname, client_id, client_secret, code);
+    warn!("TRYING {}", url);
+
     let req = HttpRequest {
-        url: format!("https://api.pcloud.com/oauth2_token?client_id={}&client_secret={}&code={}", client_id, client_secret, code),
+        url,
         headers: Default::default(),
         method: Some("GET".into()),
     };
+    warn!("request done");
+
+
     let res = http::request::<()>(&req, None);
 
+    warn!("request result"); 
     if let Ok(res) = res {
-        let r: TokenResponse = res.json()?;
+        warn!("request result: {}", res.status_code());
+        if let Ok(json) = res.json::<TokenResponse>() {
+            info!("request result: {:?}", json);
+            Ok(json)
+        } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
+            error!("request error: {:?}", json);
+            Err(WithReturnCode::new(Error::msg(format!("Error getting token: {}", json.error)), 500))
+        } else {
+            Err(WithReturnCode::new(Error::msg(format!("Error getting token")), 500))
+        }
+   
 
-        println!("VALUE {:?}", r);
-
+    } else {
+        Err(WithReturnCode::new(Error::msg(format!("Error getting token")), 500))
     }
-    Ok(PluginCredential {
-        kind: CredentialType::Oauth { url: "".to_string() },
-        login: None,
-        password: todo!(),
-        settings: todo!(),
-        refresh_token: todo!(),
-        expires: todo!(),
-        ..Default::default()
-    })
+
 
 }
 
 
+
+#[plugin_fn]
+pub fn list_path(Json(request): Json<RsPluginRequest<String>>) -> FnResult<Json<Vec<String>>> {
+    let token = request.credential.ok_or(Error::msg("Token not provided"))?.password.ok_or(Error::msg("Token not provided"))?;
+    let plugin_settings = settings_from_value(request.plugin_settings)?;
+
+
+    Ok(Json(vec![]))
+}
+fn folder_listing_internal(hostname: &str, token: &str, path: &str) -> FnResult<TokenResponse> {
+    let url = format!("https://{}/listfolder?path={}", hostname, path);
+    warn!("TRYING {}", url);
+
+    let req = HttpRequest {
+        url,
+        headers: BTreeMap::from([("authorization".to_owned(), format!("Bearer {}", token))]),
+        method: Some("GET".into()),
+    };
+    warn!("request done");
+
+
+    let res = http::request::<()>(&req, None);
+
+    warn!("request result"); 
+    if let Ok(res) = res {
+        warn!("request result: {}", res.status_code());
+        if let Ok(json) = res.json::<TokenResponse>() {
+            info!("request result: {:?}", json);
+            Ok(json)
+        } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
+            error!("request error: {:?}", json);
+            Err(WithReturnCode::new(Error::msg(format!("Error getting token: {}", json.error)), 500))
+        } else {
+            Err(WithReturnCode::new(Error::msg(format!("Error getting token")), 500))
+        }
+   
+
+    } else {
+        Err(WithReturnCode::new(Error::msg(format!("Error getting token")), 500))
+    }
+
+
+}
 
 pub fn refresh_token(left: usize, right: usize) -> usize {
     left + right
@@ -88,7 +195,6 @@ mod tests {
     fn test_oauth() -> Result<(), Box<dyn std::error::Error>> {
         
 
-        exchange_token("test", "test", "test");
         Ok(())
     }
 
