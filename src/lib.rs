@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+use extism_pdk::{http, FnResult, HttpRequest};
+use interfaces::TokenResponse;
 use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest};
 use urlencoding::encode;
-
+ pub mod interfaces;
 
 pub fn infos() -> PluginInformation {
     PluginInformation { 
@@ -39,6 +41,31 @@ pub fn get_url(path: String, credential: &PluginCredential, params: HashMap<&str
 }
 
 
+pub fn exchange_token(code: &str, client_id: &str, client_secret: &str) -> FnResult<PluginCredential> {
+    let req = HttpRequest {
+        url: format!("https://api.pcloud.com/oauth2_token?client_id={}&client_secret={}&code={}", client_id, client_secret, code),
+        headers: Default::default(),
+        method: Some("GET".into()),
+    };
+    let res = http::request::<()>(&req, None);
+
+    if let Ok(res) = res {
+        let r: TokenResponse = res.json()?;
+
+        println!("VALUE {:?}", r);
+
+    }
+    Ok(PluginCredential {
+        kind: CredentialType::Oauth { url: "".to_string() },
+        login: None,
+        password: todo!(),
+        settings: todo!(),
+        refresh_token: todo!(),
+        expires: todo!(),
+        ..Default::default()
+    })
+
+}
 
 
 
@@ -47,24 +74,17 @@ pub fn refresh_token(left: usize, right: usize) -> usize {
 }
 
 
-pub fn oauth_exchange_token(kind: CredentialType, code: String, redirect: String) -> PluginCredential {
-
-
-    PluginCredential {
-        kind,
-        login: todo!(),
-        password: todo!(),
-        settings: todo!(),
-        user_ref: todo!(),
-        refresh_token: todo!(),
-        expires: todo!(),
-    }
-    
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_oauth() -> Result<(), Box<dyn std::error::Error>> {
+        
+
+        exchange_token("test", "test", "test");
+        Ok(())
+    }
 
     #[test]
     fn test_url() -> Result<(), Box<dyn std::error::Error>> {
