@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use extism_pdk::{Error, WithReturnCode};
 use extism_pdk::{error, http, info, log, plugin_fn, warn, FnResult, HttpRequest, Json};
-use interfaces::{PCloudCredentialsSettings, PCloudErrorResponse, PCloudSettings, TokenResponse};
+use interfaces::{FolderListResponse, PCloudCredentialsSettings, PCloudErrorResponse, PCloudFile, PCloudLinkResult, PCloudSettings, PCloudStatResult, PCloudUploadResult, TokenResponse};
+use rs_plugin_common_interfaces::provider::{RsProviderAddRequest, RsProviderAddResponse, RsProviderEntry, RsProviderPath};
+use rs_plugin_common_interfaces::request::RsRequestMethod;
 use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest, RsPluginRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -58,20 +60,95 @@ pub fn get_oauth_url(settings: PCloudSettings) -> String {
     format!("https://my.pcloud.com/oauth2/authorize?response_type=code&client_id={}&state=#state#&redirect_uri=#redirecturi#", settings.client_id)
 }
 
-pub fn get_base_url(credential: &PluginCredential) -> String {
-    let location = credential.settings["location"].as_u64().unwrap_or(1);
-    if location == 1 { "api.pcloud.com".to_owned() } else { "eapi.pcloud.com".to_owned() }
-}
-
-pub fn get_url(path: String, credential: &PluginCredential, params: HashMap<&str, String>) -> RsRequest {
-    let base = get_base_url(&credential);
+pub fn get_url(path: String, credential: &PluginCredential, params: HashMap<&str, String>) -> FnResult<RsRequest> {
+    let pcloud_credential: PCloudCredentialsSettings = parse_credentials_settings(credential.settings.clone())?;
 
     let params_string = params.into_iter().map(|(key, value)| format!("{}={}", key, encode(&value))).collect::<Vec<_>>().join("&");
     //info!("{}?apikey={}&{}", url, token, params_string);
-    RsRequest {
-        url: format!("https://{}{}?{}", base, path, params_string),
+    Ok(RsRequest {
+        url: format!("https://{}{}?{}", pcloud_credential.hostname, path, params_string),
         headers: Some(vec![("authorization".to_owned(), format!("Bearer {}", credential.password.clone().unwrap_or_default()))]),
+        method: RsRequestMethod::Post,
         ..Default::default()
+    })
+}
+
+#[plugin_fn]
+pub fn upload_request(Json(settings): Json<RsPluginRequest<RsProviderAddRequest>>) -> FnResult<Json<RsProviderAddResponse>> {
+    let request: RsRequest = get_url(
+        "/uploadfile".to_string(), 
+        &settings.credential.ok_or(Error::msg("No code provided"))?, 
+        HashMap::from([("filename", settings.request.name), 
+        ("path", settings.request.root), 
+        ("nopartial", "1".to_string()), 
+        ("renameifexists", (if settings.request.overwrite { "0" } else { "1"}).to_string())]))?;
+       Ok(Json(
+            RsProviderAddResponse { request, multipart: None, source: None, packets: None }
+        ))
+}
+
+
+#[plugin_fn]
+pub fn upload_response(Json(settings): Json<RsPluginRequest<String>>) -> FnResult<Json<RsProviderEntry>> {
+    let response = serde_json::from_str::<PCloudUploadResult>(&settings.request)?;
+    let file = response.metadata.first().ok_or(Error::msg("unable to get file from response"))?.clone();
+    Ok(Json(file.into()))
+}
+
+#[plugin_fn]
+pub fn download_request(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnResult<Json<RsRequest>> {
+
+    let credentials = request.credential.ok_or(Error::msg("Token not provided"))?;
+    let token = credentials.password.ok_or(Error::msg("Token not provided"))?;
+    let pcloud_credential = parse_credentials_settings(credentials.settings)?;
+
+
+    let url = format!("https://{}/getfilelink?fileid={}", pcloud_credential.hostname, request.request.source);
+    let req = HttpRequest {
+        url,
+        headers: BTreeMap::from([("authorization".to_owned(), format!("Bearer {}", token))]),
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+    if let Ok(json) = res.json::<PCloudLinkResult>() {
+        let result: RsRequest = json.into();
+        Ok(Json(result))
+    } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
+        error!("request error: {:?}", json);
+        Err(WithReturnCode::new(Error::msg(format!("Error fetching folder content: {}", json.error)), 500))
+    } else {
+        info!("Content: {:?}", String::from_utf8_lossy(&res.body()));
+        Err(WithReturnCode::new(Error::msg(format!("Error parsing result: {:?}", res.json::<PCloudLinkResult>())), 500))
+    }
+}
+
+
+#[plugin_fn]
+pub fn remove_file(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnResult<()> {
+
+    let credentials = request.credential.ok_or(Error::msg("Token not provided"))?;
+    let token = credentials.password.ok_or(Error::msg("Token not provided"))?;
+    let pcloud_credential = parse_credentials_settings(credentials.settings)?;
+
+
+    let url = format!("https://{}/deletefile?fileid={}", pcloud_credential.hostname, request.request.source);
+    let req = HttpRequest {
+        url,
+        headers: BTreeMap::from([("authorization".to_owned(), format!("Bearer {}", token))]),
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+    if let Ok(json) = res.json::<PCloudStatResult>() {
+        
+        Ok(())
+    } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
+        error!("request error: {:?}", json);
+        Err(WithReturnCode::new(Error::msg(format!("Error deleting file: {}", json.error)), 500))
+    } else {
+        info!("Content: {:?}", String::from_utf8_lossy(&res.body()));
+        Err(WithReturnCode::new(Error::msg(format!("Error parsing result: {:?}", res.json::<PCloudStatResult>())), 500))
     }
 }
 
@@ -84,7 +161,6 @@ pub fn exchange_token(Json(settings): Json<RsPluginRequest<HashMap<String, Strin
 
     let cred_settings = PCloudCredentialsSettings {
         hostname: hostname.to_string(),
-        locationid: locationid.to_string()
     };
 
     info!("Token Code: {:?}", code);
@@ -137,41 +213,38 @@ fn exchange_token_internal(hostname: &str, code: &str, client_id: &str, client_s
 
 }
 
-
-
 #[plugin_fn]
-pub fn list_path(Json(request): Json<RsPluginRequest<String>>) -> FnResult<Json<Vec<String>>> {
-    let token = request.credential.ok_or(Error::msg("Token not provided"))?.password.ok_or(Error::msg("Token not provided"))?;
-    let plugin_settings = settings_from_value(request.plugin_settings)?;
+pub fn list_path(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnResult<Json<Vec<RsProviderEntry>>> {
+    let credentials = request.credential.ok_or(Error::msg("Token not provided"))?;
+    let token = credentials.password.ok_or(Error::msg("Token not provided"))?;
+    let pcloud_credential = parse_credentials_settings(credentials.settings)?;
+    //let plugin_settings = settings_from_value(request.plugin_settings)?;
 
-
-    Ok(Json(vec![]))
+    let paths = list_path_internal(&pcloud_credential.hostname, &token, &request.request.source)?;
+    
+    let entries = paths.into_iter().map(|p| p.into()).collect::<Vec<RsProviderEntry>>();
+    Ok(Json(entries))
 }
-fn folder_listing_internal(hostname: &str, token: &str, path: &str) -> FnResult<TokenResponse> {
-    let url = format!("https://{}/listfolder?path={}", hostname, path);
-    warn!("TRYING {}", url);
-
+fn list_path_internal(hostname: &str, token: &str, path: &str) -> FnResult<Vec<PCloudFile>> {
+    let url = format!("https://{}/listfolder?folderid={}", hostname, path);
     let req = HttpRequest {
         url,
         headers: BTreeMap::from([("authorization".to_owned(), format!("Bearer {}", token))]),
         method: Some("GET".into()),
     };
-    warn!("request done");
 
 
     let res = http::request::<()>(&req, None);
 
-    warn!("request result"); 
     if let Ok(res) = res {
-        warn!("request result: {}", res.status_code());
-        if let Ok(json) = res.json::<TokenResponse>() {
-            info!("request result: {:?}", json);
-            Ok(json)
+        if let Ok(json) = res.json::<FolderListResponse>() {
+            Ok(json.metadata.contents)
         } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
             error!("request error: {:?}", json);
-            Err(WithReturnCode::new(Error::msg(format!("Error getting token: {}", json.error)), 500))
+            Err(WithReturnCode::new(Error::msg(format!("Error fetching folder content: {}", json.error)), 500))
         } else {
-            Err(WithReturnCode::new(Error::msg(format!("Error getting token")), 500))
+            info!("Content: {:?}", String::from_utf8_lossy(&res.body()));
+            Err(WithReturnCode::new(Error::msg(format!("Error parsing result: {:?}", res.json::<FolderListResponse>())), 500))
         }
    
 
@@ -182,8 +255,32 @@ fn folder_listing_internal(hostname: &str, token: &str, path: &str) -> FnResult<
 
 }
 
-pub fn refresh_token(left: usize, right: usize) -> usize {
-    left + right
+#[plugin_fn]
+pub fn file_info(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnResult<Json<RsProviderEntry>> {
+
+    let credentials = request.credential.ok_or(Error::msg("Token not provided"))?;
+    let token = credentials.password.ok_or(Error::msg("Token not provided"))?;
+    let pcloud_credential = parse_credentials_settings(credentials.settings)?;
+
+
+    let url = format!("https://{}/stat?fileid={}", pcloud_credential.hostname, request.request.source);
+    let req = HttpRequest {
+        url,
+        headers: BTreeMap::from([("authorization".to_owned(), format!("Bearer {}", token))]),
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+    if let Ok(json) = res.json::<PCloudStatResult>() {
+        let result: RsProviderEntry = json.metadata.into();
+        Ok(Json(result))
+    } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
+        error!("request error: {:?}", json);
+        Err(WithReturnCode::new(Error::msg(format!("Error fetching folder content: {}", json.error)), 500))
+    } else {
+        info!("Content: {:?}", String::from_utf8_lossy(&res.body()));
+        Err(WithReturnCode::new(Error::msg(format!("Error parsing result: {:?}", res.json::<PCloudStatResult>())), 500))
+    }
 }
 
 
@@ -193,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_oauth() -> Result<(), Box<dyn std::error::Error>> {
-        
+        let folders = list_path_internal("eapi.pcloud.com", "xxx", "/");
 
         Ok(())
     }
@@ -203,7 +300,7 @@ mod tests {
         let credential = "{\"kind\": \"oauth\", \"password\": \"pwd\", \"settings\": {\"location\": 1}}";
         let credential: PluginCredential = serde_json::from_str(credential)?;
 
-        let request = get_url("/testpath".to_owned(), &credential, HashMap::from([("test", "toto".to_owned())]));
+        let request = get_url("/testpath".to_owned(), &credential, HashMap::from([("test", "toto".to_owned())])).unwrap();
         assert_eq!("https://api.pcloud.com/testpath?test=toto", request.url);
         assert_eq!(Some(vec![("authorization".to_owned(), "Bearer pwd".to_owned())]), request.headers);
         println!("urk: {:?}", request);
