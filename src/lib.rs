@@ -21,7 +21,6 @@ pub static DEFAULT_CLIENT_ID: &str = "4zSGTdUSUBV";
 pub static DEFAULT_CLIENT_SECRET: &str = "uoUSvu8YcxXzb2iRGssdhyuFr9sk";
 
 pub fn infos_internal() -> PluginInformation {
-    warn!("VALUESTY");
     PluginInformation { 
         name: "pcloud".into(), 
         capabilities: vec![PluginType::Provider], 

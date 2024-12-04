@@ -76,6 +76,7 @@ pub struct PCloudFile {
     created: Option<OffsetDateTime>,
     pub folderid: Option<u64>,
     pub fileid: Option<u64>,
+    pub size: Option<u64>,
     pub contenttype: Option<String>,
 }
 
@@ -94,7 +95,7 @@ impl From<PCloudFile> for RsProviderEntry {
             source: value.id(),
             kind: if value.isfolder { RsProviderEntryType::Directory } else { RsProviderEntryType::Other },
             mimetype: value.contenttype,
-            size: None,
+            size: value.size,
             hash: value.hash.map(|f| f.to_string()),
             added: None,
             modified: value.modified.map(|r| r.unix_timestamp() as u64 * 1000),
