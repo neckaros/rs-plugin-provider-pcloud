@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use extism_pdk::{Error, WithReturnCode};
-use extism_pdk::{error, http, info, log, plugin_fn, warn, FnResult, HttpRequest, Json};
+use extism_pdk::{error, http, info, plugin_fn, FnResult, HttpRequest, Json};
 use interfaces::{FolderListResponse, PCloudCredentialsSettings, PCloudErrorResponse, PCloudFile, PCloudLinkResult, PCloudSettings, PCloudStatResult, PCloudUploadResult, TokenResponse};
 use rs_plugin_common_interfaces::provider::{RsProviderAddRequest, RsProviderAddResponse, RsProviderEntry, RsProviderPath};
 use rs_plugin_common_interfaces::request::RsRequestMethod;
 use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest, RsPluginRequest};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use urlencoding::encode;
 pub mod interfaces;
@@ -139,8 +138,7 @@ pub fn remove_file(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnRe
     };
 
     let res = http::request::<()>(&req, None)?;
-    if let Ok(json) = res.json::<PCloudStatResult>() {
-        
+    if res.json::<PCloudStatResult>().is_ok() {
         Ok(())
     } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
         error!("request error: {:?}", json);
@@ -180,21 +178,19 @@ pub fn exchange_token(Json(settings): Json<RsPluginRequest<HashMap<String, Strin
 
 fn exchange_token_internal(hostname: &str, code: &str, client_id: &str, client_secret: &str) -> FnResult<TokenResponse> {
     let url = format!("https://{}/oauth2_token?client_id={}&client_secret={}&code={}", hostname, client_id, client_secret, code);
-    warn!("TRYING {}", url);
 
     let req = HttpRequest {
         url,
         headers: Default::default(),
         method: Some("GET".into()),
     };
-    warn!("request done");
 
 
     let res = http::request::<()>(&req, None);
 
-    warn!("request result"); 
+
     if let Ok(res) = res {
-        warn!("request result: {}", res.status_code());
+
         if let Ok(json) = res.json::<TokenResponse>() {
             info!("request result: {:?}", json);
             Ok(json)
@@ -202,12 +198,12 @@ fn exchange_token_internal(hostname: &str, code: &str, client_id: &str, client_s
             error!("request error: {:?}", json);
             Err(WithReturnCode::new(Error::msg(format!("Error getting token: {}", json.error)), 500))
         } else {
-            Err(WithReturnCode::new(Error::msg(format!("Error getting token")), 500))
+            Err(WithReturnCode::new(Error::msg("Error getting token".to_string()), 500))
         }
    
 
     } else {
-        Err(WithReturnCode::new(Error::msg(format!("Error getting token")), 500))
+        Err(WithReturnCode::new(Error::msg("Error getting token".to_string()), 500))
     }
 
 
@@ -249,7 +245,7 @@ fn list_path_internal(hostname: &str, token: &str, path: &str) -> FnResult<Vec<P
    
 
     } else {
-        Err(WithReturnCode::new(Error::msg(format!("Error getting token")), 500))
+        Err(WithReturnCode::new(Error::msg("Error listing paths".to_string()), 500))
     }
 
 
