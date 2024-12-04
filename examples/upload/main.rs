@@ -2,12 +2,18 @@
 use extism::{convert::Json, Manifest, PluginBuilder};
 use std::path::PathBuf;
 
+use reqwest::Client;
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
+
+
 use rs_plugin_common_interfaces::{provider::{RsProviderAddRequest, RsProviderAddResponse, RsProviderEntry, RsProviderPath}, PluginCredential, RsPluginRequest};
 
 use serde_json::json;
 
 
-fn main() {
+#[tokio::main]
+async fn main() {
     extism::set_log_callback(|f| println!("{}",f), "info");
     println!("Hello from an example!");
     let manifest = Manifest::new([PathBuf::from("target/wasm32-unknown-unknown/release/rs_plugin_provider_pcloud.wasm")]).with_allowed_host("*");
@@ -20,8 +26,8 @@ fn main() {
 
 
     let request = RsProviderAddRequest {
-        root: "/Backups".to_string(),
-        name: "test.txt".to_string(),
+        root: "/test".to_string(),
+        name: "test.rtf".to_string(),
         overwrite: true,
     };
 
@@ -38,9 +44,29 @@ fn main() {
     };
 
         
-    let token = plugin.call::<Json<RsPluginRequest<RsProviderAddRequest>>, Json<RsProviderAddResponse>>("upload_request", Json(call_object));
+    let Json(token) = plugin.call::<Json<RsPluginRequest<RsProviderAddRequest>>, Json<RsProviderAddResponse>>("upload_request", Json(call_object)).unwrap();
 
     println!("link: {:?}", token);
+
+    let file = File::open("examples/upload/test.rtf").await.unwrap();
+    let file_size = file.metadata().await.unwrap().len();
+    let stream = ReaderStream::new(file);
+    let body = reqwest::Body::wrap_stream(stream);
+
+    let client = Client::new();
+    let response = client
+        .post(token.request.url)
+        .header("Authorization", format!("Bearer {}", "token"))
+        .header("Content-Length", file_size)
+        .header("Content-Type", "application/rtf")
+       //.header("Connection", "keep-alive")
+        //.header("Accept-Encoding", "gzip, deflate, br")
+        .body(body)
+        .send()
+        .await.unwrap();
+
+    println!("Upload status: {}", response.status());
+    println!("Upload response: {}", response.text().await.unwrap());
 
     let json_string = r#"{
         "result": 0,

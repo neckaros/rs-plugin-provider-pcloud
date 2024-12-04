@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rs_plugin_common_interfaces::{provider::{RsProviderEntry, RsProviderEntryType}, request::RsRequestMethod, RsFileType, RsRequest};
+use rs_plugin_common_interfaces::{provider::{RsProviderEntry, RsProviderEntryType}, request::RsRequestMethod, RsFileType, RsRequest, RsRequestStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -28,6 +28,7 @@ fn default_client_secret() -> String {
 #[serde(rename_all = "snake_case")] 
 pub struct PCloudCredentialsSettings {
     pub hostname: String,
+    pub locationid: String,
 }
 
 
@@ -144,6 +145,7 @@ impl From<PCloudLinkResult> for RsRequest {
             url: format!("https://{}{}",value.hosts.first().unwrap(), value.path),
             permanent: false,
             method: RsRequestMethod::Get,
+            status: RsRequestStatus::FinalPrivate,
             ..Default::default()
         }
     }

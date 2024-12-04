@@ -24,3 +24,7 @@ name = "token"
 
 [dev-dependencies]
 extism = "1.2.0"
+reqwest = { version = "0.12.3", features = ["stream", "gzip"]}
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7.11", features = ["compat", "io", "io-util"] }
+tokio-stream = { version = "0.1.14", features = ["io-util"] }

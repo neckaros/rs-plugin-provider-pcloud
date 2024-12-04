@@ -50,7 +50,7 @@ pub fn settings_from_value(value: Value)-> FnResult<PCloudSettings> {
 pub fn parse_credentials_settings(value: Value)-> FnResult<PCloudCredentialsSettings> {
     let cred_settings: PCloudCredentialsSettings = serde_json::from_value(value).map_err(|e| {
         error!("Error deserializing credentials settings: {:?}", e);
-        Error::msg("Unable to deserialize credentials settings")
+        Error::msg(format!("Unable to deserialize credentials settings: {:?}", e))
 })?;
 
     Ok(cred_settings)
@@ -161,6 +161,7 @@ pub fn exchange_token(Json(settings): Json<RsPluginRequest<HashMap<String, Strin
 
     let cred_settings = PCloudCredentialsSettings {
         hostname: hostname.to_string(),
+        locationid: locationid.to_string()
     };
 
     info!("Token Code: {:?}", code);
