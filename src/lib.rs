@@ -4,7 +4,7 @@ use extism_pdk::{Error, WithReturnCode};
 use extism_pdk::{error, http, info, plugin_fn, FnResult, HttpRequest, Json};
 use interfaces::{FolderListResponse, PCloudCredentialsSettings, PCloudErrorResponse, PCloudFile, PCloudLinkResult, PCloudSettings, PCloudStatResult, PCloudUploadResult, TokenResponse};
 use rs_plugin_common_interfaces::provider::{RsProviderAddRequest, RsProviderAddResponse, RsProviderEntry, RsProviderPath};
-use rs_plugin_common_interfaces::request::RsRequestMethod;
+use rs_plugin_common_interfaces::request::{self, RsRequestMethod};
 use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest, RsPluginRequest};
 use serde_json::{json, Value};
 use urlencoding::encode;
@@ -101,7 +101,11 @@ pub fn download_request(Json(request): Json<RsPluginRequest<RsProviderPath>>) ->
     let pcloud_credential = parse_credentials_settings(credentials.settings)?;
 
 
-    let url = format!("https://{}/getfilelink?fileid={}", pcloud_credential.hostname, request.request.source);
+    let url = if request.request.source.starts_with("/") { 
+        format!("https://{}/getfilelink?path={}{}", pcloud_credential.hostname, request.request.root.unwrap_or("/".to_string()), request.request.source)
+    } else {
+        format!("https://{}/getfilelink?fileid={}", pcloud_credential.hostname, request.request.source)
+    }; 
     let req = HttpRequest {
         url,
         headers: BTreeMap::from([("authorization".to_owned(), format!("Bearer {}", token))]),
