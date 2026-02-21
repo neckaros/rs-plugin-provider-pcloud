@@ -134,7 +134,11 @@ pub fn remove_file(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnRe
     let pcloud_credential = parse_credentials_settings(credentials.settings)?;
 
 
-    let url = format!("https://{}/deletefile?fileid={}", pcloud_credential.hostname, request.request.source);
+    let url = if request.request.source.starts_with("/") { 
+        format!("https://{}/deletefile?path={}{}", pcloud_credential.hostname, request.request.root.unwrap_or("/".to_string()), request.request.source)
+    } else {
+        format!("https://{}/deletefile?fileid={}", pcloud_credential.hostname, request.request.source)
+    }; 
     let req = HttpRequest {
         url,
         headers: BTreeMap::from([("authorization".to_owned(), format!("Bearer {}", token))]),
