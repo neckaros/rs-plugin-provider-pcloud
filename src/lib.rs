@@ -4,7 +4,7 @@ use extism_pdk::{Error, WithReturnCode};
 use extism_pdk::{error, http, info, plugin_fn, FnResult, HttpRequest, Json};
 use interfaces::{FolderListResponse, PCloudCredentialsSettings, PCloudErrorResponse, PCloudFile, PCloudLinkResult, PCloudSettings, PCloudStatResult, PCloudUploadResult, TokenResponse};
 use rs_plugin_common_interfaces::provider::{RsProviderAddRequest, RsProviderAddResponse, RsProviderEntry, RsProviderPath};
-use rs_plugin_common_interfaces::request::{self, RsRequestMethod};
+use rs_plugin_common_interfaces::request::RsRequestMethod;
 use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest, RsPluginRequest};
 use serde_json::{json, Value};
 use urlencoding::encode;
@@ -24,6 +24,7 @@ pub fn infos_internal() -> PluginInformation {
         name: "pcloud".into(), 
         capabilities: vec![PluginType::Provider], 
         version: 1, 
+        repo: Some("https://github.com/neckaros/rs-plugin-provider-pcloud".into()),
         interface_version: 1, 
         publisher: "neckaros".into(), 
         description: "PCloud provider".into(), 
@@ -73,12 +74,32 @@ pub fn get_url(path: String, credential: &PluginCredential, params: HashMap<&str
 
 #[plugin_fn]
 pub fn upload_request(Json(settings): Json<RsPluginRequest<RsProviderAddRequest>>) -> FnResult<Json<RsProviderAddResponse>> {
+    let credential = settings.credential.ok_or(Error::msg("No code provided"))?;
+
+    // Ensure the target folder exists
+    let create_folder_req = get_url(
+        "/createfolderifnotexists".to_string(),
+        &credential,
+        HashMap::from([("path", settings.request.root.clone())]))?;
+    let http_req = HttpRequest {
+        url: create_folder_req.url,
+        headers: create_folder_req.headers.unwrap_or_default().into_iter().collect(),
+        method: Some("GET".into()),
+    };
+    let res = http::request::<()>(&http_req, None)?;
+    if let Ok(err_response) = res.json::<PCloudErrorResponse>() {
+        if err_response.result != 0 {
+            error!("create folder error: {:?}", err_response);
+            return Err(WithReturnCode::new(Error::msg(format!("Error creating folder: {}", err_response.error)), 500));
+        }
+    }
+
     let request: RsRequest = get_url(
-        "/uploadfile".to_string(), 
-        &settings.credential.ok_or(Error::msg("No code provided"))?, 
-        HashMap::from([("filename", settings.request.name), 
-        ("path", settings.request.root), 
-        ("nopartial", "1".to_string()), 
+        "/uploadfile".to_string(),
+        &credential,
+        HashMap::from([("filename", settings.request.name),
+        ("path", settings.request.root),
+        ("nopartial", "1".to_string()),
         ("renameifexists", (if settings.request.overwrite { "0" } else { "1"}).to_string())]))?;
        Ok(Json(
             RsProviderAddResponse { request, multipart: None, source: None, packets: None }
@@ -88,9 +109,16 @@ pub fn upload_request(Json(settings): Json<RsPluginRequest<RsProviderAddRequest>
 
 #[plugin_fn]
 pub fn upload_response(Json(settings): Json<RsPluginRequest<String>>) -> FnResult<Json<RsProviderEntry>> {
-    let response = serde_json::from_str::<PCloudUploadResult>(&settings.request)?;
-    let file = response.metadata.first().ok_or(Error::msg("unable to get file from response"))?.clone();
-    Ok(Json(file.into()))
+    if let Ok(response) = serde_json::from_str::<PCloudUploadResult>(&settings.request) {
+        let file = response.metadata.first().ok_or(Error::msg("unable to get file from response"))?.clone();
+        Ok(Json(file.into()))
+    } else if let Ok(json) = serde_json::from_str::<PCloudErrorResponse>(&settings.request) {
+        error!("upload error: {:?}", json);
+        Err(WithReturnCode::new(Error::msg(format!("Upload error: {}", json.error)), 500))
+    } else {
+        error!("upload unknown response: {}", &settings.request);
+        Err(WithReturnCode::new(Error::msg("Error parsing upload response"), 500))
+    }
 }
 
 #[plugin_fn]

@@ -1,8 +1,5 @@
-use std::collections::HashMap;
-
-use rs_plugin_common_interfaces::{provider::{RsProviderEntry, RsProviderEntryType}, request::RsRequestMethod, RsFileType, RsRequest, RsRequestStatus};
+use rs_plugin_common_interfaces::{provider::{RsProviderEntry, RsProviderEntryType}, request::RsRequestMethod, RsRequest, RsRequestStatus};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::{DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET};
@@ -98,7 +95,7 @@ impl From<PCloudFile> for RsProviderEntry {
             size: value.size,
             hash: value.hash.map(|f| f.to_string()),
             added: None,
-            modified: value.modified.map(|r| r.unix_timestamp() as u64 * 1000),
+            modified: value.modified.map(|r| r.unix_timestamp() * 1000),
             created: value.created.map(|r| r.unix_timestamp() * 1000),
         }
     }
