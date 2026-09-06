@@ -23,7 +23,7 @@ pub fn infos_internal() -> PluginInformation {
     PluginInformation { 
         name: "pcloud".into(), 
         capabilities: vec![PluginType::Provider], 
-        version: 1, 
+        version: 3,
         repo: Some("https://github.com/neckaros/rs-plugin-provider-pcloud".into()),
         interface_version: 1, 
         publisher: "neckaros".into(), 
@@ -337,5 +337,11 @@ mod tests {
         assert_eq!(Some(vec![("authorization".to_owned(), "Bearer pwd".to_owned())]), request.headers);
         println!("urk: {:?}", request);
         Ok(())
+    }
+
+    #[test]
+    fn plugin_version_matches_package_minor_version() {
+        let package_minor = env!("CARGO_PKG_VERSION_MINOR").parse::<u16>().unwrap();
+        assert_eq!(infos_internal().version, package_minor);
     }
 }
