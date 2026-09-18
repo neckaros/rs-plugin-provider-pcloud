@@ -66,6 +66,12 @@ impl DownloadLinkCache {
         }
         self.entries.push(CachedDownloadLink { key, link, last_used: sequence });
     }
+
+    fn remove(&mut self, key: &str) -> bool {
+        let previous_len = self.entries.len();
+        self.entries.retain(|entry| entry.key != key);
+        self.entries.len() != previous_len
+    }
 }
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
@@ -97,7 +103,8 @@ pub fn infos_internal() -> PluginInformation {
 
 fn download_link_cache_key(hostname: &str, token: &str, root: &str, source: &str) -> String {
     let mut hasher = Sha256::new();
-    for value in [hostname, token, root, source] {
+    let root_scope = if source.starts_with('/') { root } else { "" };
+    for value in [hostname, token, root_scope, source] {
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
@@ -135,6 +142,13 @@ fn cache_download_link(cache_key: &str, link: &PCloudLinkResult) {
     let mut cache = load_download_link_cache();
     cache.insert(cache_key.to_string(), link.clone(), OffsetDateTime::now_utc());
     save_download_link_cache(&cache);
+}
+
+fn evict_cached_download_link(cache_key: &str) {
+    let mut cache = load_download_link_cache();
+    if cache.remove(cache_key) {
+        save_download_link_cache(&cache);
+    }
 }
 
 pub fn settings_from_value(value: Value)-> FnResult<PCloudSettings> {
@@ -267,12 +281,15 @@ pub fn remove_file(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnRe
     let credentials = request.credential.ok_or(Error::msg("Token not provided"))?;
     let token = credentials.password.ok_or(Error::msg("Token not provided"))?;
     let pcloud_credential = parse_credentials_settings(credentials.settings)?;
+    let source = request.request.source;
+    let root = request.request.root.unwrap_or_else(|| "/".to_string());
+    let cache_key = download_link_cache_key(&pcloud_credential.hostname, &token, &root, &source);
 
 
-    let url = if request.request.source.starts_with("/") { 
-        format!("https://{}/deletefile?path={}{}", pcloud_credential.hostname, request.request.root.unwrap_or("/".to_string()), request.request.source)
+    let url = if source.starts_with("/") {
+        format!("https://{}/deletefile?path={}{}", pcloud_credential.hostname, root, source)
     } else {
-        format!("https://{}/deletefile?fileid={}", pcloud_credential.hostname, request.request.source)
+        format!("https://{}/deletefile?fileid={}", pcloud_credential.hostname, source)
     }; 
     let req = HttpRequest {
         url,
@@ -282,6 +299,7 @@ pub fn remove_file(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnRe
 
     let res = http::request::<()>(&req, None)?;
     if res.json::<PCloudStatResult>().is_ok() {
+        evict_cached_download_link(&cache_key);
         Ok(())
     } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
         error!("request error: {:?}", json);
@@ -458,6 +476,11 @@ mod tests {
         assert_eq!(base, download_link_cache_key("eapi.pcloud.com", "token-a", "/mangas", "123"));
         assert_ne!(base, download_link_cache_key("eapi.pcloud.com", "token-b", "/mangas", "123"));
         assert_ne!(base, download_link_cache_key("eapi.pcloud.com", "token-a", "/mangas", "456"));
+        assert_eq!(base, download_link_cache_key("eapi.pcloud.com", "token-a", "/other", "123"));
+        assert_ne!(
+            download_link_cache_key("eapi.pcloud.com", "token-a", "/mangas", "/chapter.cbz"),
+            download_link_cache_key("eapi.pcloud.com", "token-a", "/other", "/chapter.cbz")
+        );
     }
 
     #[test]
@@ -497,5 +520,9 @@ mod tests {
         assert_eq!(cache.entries.len(), DOWNLOAD_LINK_CACHE_CAPACITY);
         assert!(cache.entries.iter().any(|entry| entry.key == "0"));
         assert!(cache.entries.iter().all(|entry| entry.key != "1"));
+
+        assert!(cache.remove("0"));
+        assert!(cache.entries.iter().all(|entry| entry.key != "0"));
+        assert!(!cache.remove("missing"));
     }
 }
