@@ -1,14 +1,78 @@
 use std::collections::{BTreeMap, HashMap};
 
 use extism_pdk::{Error, WithReturnCode};
-use extism_pdk::{error, http, info, plugin_fn, FnResult, HttpRequest, Json};
+use extism_pdk::{error, http, info, plugin_fn, var, FnResult, HttpRequest, Json};
 use interfaces::{FolderListResponse, PCloudCredentialsSettings, PCloudErrorResponse, PCloudFile, PCloudLinkResult, PCloudSettings, PCloudStatResult, PCloudUploadResult, TokenResponse};
 use rs_plugin_common_interfaces::provider::{RsProviderAddRequest, RsProviderAddResponse, RsProviderEntry, RsProviderPath};
 use rs_plugin_common_interfaces::request::RsRequestMethod;
 use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest, RsPluginRequest};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use time::{Duration, OffsetDateTime};
 use urlencoding::encode;
 pub mod interfaces;
+
+const DOWNLOAD_LINK_EXPIRY_MARGIN: Duration = Duration::seconds(60);
+const DOWNLOAD_LINK_CACHE_CAPACITY: usize = 32;
+const DOWNLOAD_LINK_CACHE_VARIABLE: &str = "pcloud-download-links-v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedDownloadLink {
+    key: String,
+    link: PCloudLinkResult,
+    last_used: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DownloadLinkCache {
+    entries: Vec<CachedDownloadLink>,
+    sequence: u64,
+}
+
+impl DownloadLinkCache {
+    fn sweep_expired(&mut self, now: OffsetDateTime) {
+        self.entries.retain(|entry| download_link_is_reusable(&entry.link, now));
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self.sequence.wrapping_add(1);
+        self.sequence
+    }
+
+    fn get(&mut self, key: &str, now: OffsetDateTime) -> Option<PCloudLinkResult> {
+        self.sweep_expired(now);
+        let position = self.entries.iter().position(|entry| entry.key == key)?;
+        let sequence = self.next_sequence();
+        self.entries[position].last_used = sequence;
+        Some(self.entries[position].link.clone())
+    }
+
+    fn insert(&mut self, key: String, link: PCloudLinkResult, now: OffsetDateTime) {
+        self.sweep_expired(now);
+        if !download_link_is_reusable(&link, now) {
+            return;
+        }
+        let sequence = self.next_sequence();
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.link = link;
+            entry.last_used = sequence;
+            return;
+        }
+        if self.entries.len() >= DOWNLOAD_LINK_CACHE_CAPACITY {
+            if let Some((position, _)) = self.entries.iter().enumerate().min_by_key(|(_, entry)| entry.last_used) {
+                self.entries.swap_remove(position);
+            }
+        }
+        self.entries.push(CachedDownloadLink { key, link, last_used: sequence });
+    }
+
+    fn remove(&mut self, key: &str) -> bool {
+        let previous_len = self.entries.len();
+        self.entries.retain(|entry| entry.key != key);
+        self.entries.len() != previous_len
+    }
+}
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
@@ -23,7 +87,7 @@ pub fn infos_internal() -> PluginInformation {
     PluginInformation { 
         name: "pcloud".into(), 
         capabilities: vec![PluginType::Provider], 
-        version: 3,
+        version: 4,
         repo: Some("https://github.com/neckaros/rs-plugin-provider-pcloud".into()),
         interface_version: 1, 
         publisher: "neckaros".into(), 
@@ -35,6 +99,56 @@ pub fn infos_internal() -> PluginInformation {
         credential_kind: Some(CredentialType::Oauth { url: format!("https://my.pcloud.com/oauth2/authorize?response_type=code&client_id={}&state=#state#&redirect_uri=#redirecturi#", DEFAULT_CLIENT_ID) }), 
         ..Default::default() }
 
+}
+
+fn download_link_cache_key(hostname: &str, token: &str, root: &str, source: &str) -> String {
+    let mut hasher = Sha256::new();
+    let root_scope = if source.starts_with('/') { root } else { "" };
+    for value in [hostname, token, root_scope, source] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("pcloud-download-link:{:x}", hasher.finalize())
+}
+
+fn download_link_is_reusable(link: &PCloudLinkResult, now: OffsetDateTime) -> bool {
+    link.expires > now + DOWNLOAD_LINK_EXPIRY_MARGIN
+}
+
+fn load_download_link_cache() -> DownloadLinkCache {
+    var::get::<String>(DOWNLOAD_LINK_CACHE_VARIABLE)
+        .ok()
+        .flatten()
+        .and_then(|cached| serde_json::from_str(&cached).ok())
+        .unwrap_or_default()
+}
+
+fn save_download_link_cache(cache: &DownloadLinkCache) {
+    if let Ok(serialized) = serde_json::to_string(cache) {
+        if let Err(cache_error) = var::set(DOWNLOAD_LINK_CACHE_VARIABLE, serialized) {
+            error!("Unable to cache pCloud download links: {:?}", cache_error);
+        }
+    }
+}
+
+fn cached_download_link(cache_key: &str) -> Option<PCloudLinkResult> {
+    let mut cache = load_download_link_cache();
+    let link = cache.get(cache_key, OffsetDateTime::now_utc());
+    save_download_link_cache(&cache);
+    link
+}
+
+fn cache_download_link(cache_key: &str, link: &PCloudLinkResult) {
+    let mut cache = load_download_link_cache();
+    cache.insert(cache_key.to_string(), link.clone(), OffsetDateTime::now_utc());
+    save_download_link_cache(&cache);
+}
+
+fn evict_cached_download_link(cache_key: &str) {
+    let mut cache = load_download_link_cache();
+    if cache.remove(cache_key) {
+        save_download_link_cache(&cache);
+    }
 }
 
 pub fn settings_from_value(value: Value)-> FnResult<PCloudSettings> {
@@ -127,12 +241,18 @@ pub fn download_request(Json(request): Json<RsPluginRequest<RsProviderPath>>) ->
     let credentials = request.credential.ok_or(Error::msg("Token not provided"))?;
     let token = credentials.password.ok_or(Error::msg("Token not provided"))?;
     let pcloud_credential = parse_credentials_settings(credentials.settings)?;
+    let source = request.request.source;
+    let root = request.request.root.unwrap_or_else(|| "/".to_string());
+    let cache_key = download_link_cache_key(&pcloud_credential.hostname, &token, &root, &source);
 
+    if let Some(link) = cached_download_link(&cache_key) {
+        return Ok(Json(link.into()));
+    }
 
-    let url = if request.request.source.starts_with("/") { 
-        format!("https://{}/getfilelink?path={}{}", pcloud_credential.hostname, request.request.root.unwrap_or("/".to_string()), request.request.source)
+    let url = if source.starts_with("/") {
+        format!("https://{}/getfilelink?path={}{}", pcloud_credential.hostname, root, source)
     } else {
-        format!("https://{}/getfilelink?fileid={}", pcloud_credential.hostname, request.request.source)
+        format!("https://{}/getfilelink?fileid={}", pcloud_credential.hostname, source)
     }; 
     let req = HttpRequest {
         url,
@@ -142,6 +262,7 @@ pub fn download_request(Json(request): Json<RsPluginRequest<RsProviderPath>>) ->
 
     let res = http::request::<()>(&req, None)?;
     if let Ok(json) = res.json::<PCloudLinkResult>() {
+        cache_download_link(&cache_key, &json);
         let result: RsRequest = json.into();
         Ok(Json(result))
     } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
@@ -160,12 +281,15 @@ pub fn remove_file(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnRe
     let credentials = request.credential.ok_or(Error::msg("Token not provided"))?;
     let token = credentials.password.ok_or(Error::msg("Token not provided"))?;
     let pcloud_credential = parse_credentials_settings(credentials.settings)?;
+    let source = request.request.source;
+    let root = request.request.root.unwrap_or_else(|| "/".to_string());
+    let cache_key = download_link_cache_key(&pcloud_credential.hostname, &token, &root, &source);
 
 
-    let url = if request.request.source.starts_with("/") { 
-        format!("https://{}/deletefile?path={}{}", pcloud_credential.hostname, request.request.root.unwrap_or("/".to_string()), request.request.source)
+    let url = if source.starts_with("/") {
+        format!("https://{}/deletefile?path={}{}", pcloud_credential.hostname, root, source)
     } else {
-        format!("https://{}/deletefile?fileid={}", pcloud_credential.hostname, request.request.source)
+        format!("https://{}/deletefile?fileid={}", pcloud_credential.hostname, source)
     }; 
     let req = HttpRequest {
         url,
@@ -175,6 +299,7 @@ pub fn remove_file(Json(request): Json<RsPluginRequest<RsProviderPath>>) -> FnRe
 
     let res = http::request::<()>(&req, None)?;
     if res.json::<PCloudStatResult>().is_ok() {
+        evict_cached_download_link(&cache_key);
         Ok(())
     } else if  let Ok(json) = res.json::<PCloudErrorResponse>() {
         error!("request error: {:?}", json);
@@ -343,5 +468,61 @@ mod tests {
     fn plugin_version_matches_package_minor_version() {
         let package_minor = env!("CARGO_PKG_VERSION_MINOR").parse::<u16>().unwrap();
         assert_eq!(infos_internal().version, package_minor);
+    }
+
+    #[test]
+    fn download_link_cache_is_scoped_to_credentials_and_source() {
+        let base = download_link_cache_key("eapi.pcloud.com", "token-a", "/mangas", "123");
+        assert_eq!(base, download_link_cache_key("eapi.pcloud.com", "token-a", "/mangas", "123"));
+        assert_ne!(base, download_link_cache_key("eapi.pcloud.com", "token-b", "/mangas", "123"));
+        assert_ne!(base, download_link_cache_key("eapi.pcloud.com", "token-a", "/mangas", "456"));
+        assert_eq!(base, download_link_cache_key("eapi.pcloud.com", "token-a", "/other", "123"));
+        assert_ne!(
+            download_link_cache_key("eapi.pcloud.com", "token-a", "/mangas", "/chapter.cbz"),
+            download_link_cache_key("eapi.pcloud.com", "token-a", "/other", "/chapter.cbz")
+        );
+    }
+
+    #[test]
+    fn download_link_cache_respects_expiry_margin() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut link = PCloudLinkResult {
+            result: 0,
+            path: "/download".to_string(),
+            expires: now + Duration::seconds(61),
+            hosts: vec!["example.test".to_string()],
+        };
+        assert!(download_link_is_reusable(&link, now));
+
+        link.expires = now + Duration::seconds(60);
+        assert!(!download_link_is_reusable(&link, now));
+    }
+
+    #[test]
+    fn download_link_cache_sweeps_expired_entries_and_evicts_lru() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let link = |expires| PCloudLinkResult {
+            result: 0,
+            path: "/download".to_string(),
+            expires,
+            hosts: vec!["example.test".to_string()],
+        };
+        let mut cache = DownloadLinkCache::default();
+        cache.insert("expired".to_string(), link(now + Duration::seconds(30)), now);
+        for index in 0..DOWNLOAD_LINK_CACHE_CAPACITY {
+            cache.insert(index.to_string(), link(now + Duration::hours(1)), now);
+        }
+        assert_eq!(cache.entries.len(), DOWNLOAD_LINK_CACHE_CAPACITY);
+        assert!(cache.entries.iter().all(|entry| entry.key != "expired"));
+
+        assert!(cache.get("0", now).is_some());
+        cache.insert("new".to_string(), link(now + Duration::hours(1)), now);
+        assert_eq!(cache.entries.len(), DOWNLOAD_LINK_CACHE_CAPACITY);
+        assert!(cache.entries.iter().any(|entry| entry.key == "0"));
+        assert!(cache.entries.iter().all(|entry| entry.key != "1"));
+
+        assert!(cache.remove("0"));
+        assert!(cache.entries.iter().all(|entry| entry.key != "0"));
+        assert!(!cache.remove("missing"));
     }
 }
