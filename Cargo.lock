@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "rs-plugin-provider-pcloud"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "extism",
  "extism-pdk",
@@ -1819,6 +1819,7 @@ dependencies = [
  "rs-plugin-common-interfaces",
  "serde",
  "serde_json",
+ "sha2",
  "time",
  "tokio",
  "tokio-stream",
