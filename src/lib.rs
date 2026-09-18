@@ -6,6 +6,7 @@ use interfaces::{FolderListResponse, PCloudCredentialsSettings, PCloudErrorRespo
 use rs_plugin_common_interfaces::provider::{RsProviderAddRequest, RsProviderAddResponse, RsProviderEntry, RsProviderPath};
 use rs_plugin_common_interfaces::request::RsRequestMethod;
 use rs_plugin_common_interfaces::{CredentialType, CustomParam, CustomParamTypes, PluginCredential, PluginInformation, PluginType, RsRequest, RsPluginRequest};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
@@ -13,6 +14,59 @@ use urlencoding::encode;
 pub mod interfaces;
 
 const DOWNLOAD_LINK_EXPIRY_MARGIN: Duration = Duration::seconds(60);
+const DOWNLOAD_LINK_CACHE_CAPACITY: usize = 32;
+const DOWNLOAD_LINK_CACHE_VARIABLE: &str = "pcloud-download-links-v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedDownloadLink {
+    key: String,
+    link: PCloudLinkResult,
+    last_used: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DownloadLinkCache {
+    entries: Vec<CachedDownloadLink>,
+    sequence: u64,
+}
+
+impl DownloadLinkCache {
+    fn sweep_expired(&mut self, now: OffsetDateTime) {
+        self.entries.retain(|entry| download_link_is_reusable(&entry.link, now));
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self.sequence.wrapping_add(1);
+        self.sequence
+    }
+
+    fn get(&mut self, key: &str, now: OffsetDateTime) -> Option<PCloudLinkResult> {
+        self.sweep_expired(now);
+        let position = self.entries.iter().position(|entry| entry.key == key)?;
+        let sequence = self.next_sequence();
+        self.entries[position].last_used = sequence;
+        Some(self.entries[position].link.clone())
+    }
+
+    fn insert(&mut self, key: String, link: PCloudLinkResult, now: OffsetDateTime) {
+        self.sweep_expired(now);
+        if !download_link_is_reusable(&link, now) {
+            return;
+        }
+        let sequence = self.next_sequence();
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.link = link;
+            entry.last_used = sequence;
+            return;
+        }
+        if self.entries.len() >= DOWNLOAD_LINK_CACHE_CAPACITY {
+            if let Some((position, _)) = self.entries.iter().enumerate().min_by_key(|(_, entry)| entry.last_used) {
+                self.entries.swap_remove(position);
+            }
+        }
+        self.entries.push(CachedDownloadLink { key, link, last_used: sequence });
+    }
+}
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
@@ -54,23 +108,33 @@ fn download_link_is_reusable(link: &PCloudLinkResult, now: OffsetDateTime) -> bo
     link.expires > now + DOWNLOAD_LINK_EXPIRY_MARGIN
 }
 
-fn cached_download_link(cache_key: &str) -> Option<PCloudLinkResult> {
-    let cached = var::get::<String>(cache_key).ok().flatten()?;
-    let link = serde_json::from_str::<PCloudLinkResult>(&cached).ok()?;
-    if download_link_is_reusable(&link, OffsetDateTime::now_utc()) {
-        Some(link)
-    } else {
-        let _ = var::remove(cache_key);
-        None
+fn load_download_link_cache() -> DownloadLinkCache {
+    var::get::<String>(DOWNLOAD_LINK_CACHE_VARIABLE)
+        .ok()
+        .flatten()
+        .and_then(|cached| serde_json::from_str(&cached).ok())
+        .unwrap_or_default()
+}
+
+fn save_download_link_cache(cache: &DownloadLinkCache) {
+    if let Ok(serialized) = serde_json::to_string(cache) {
+        if let Err(cache_error) = var::set(DOWNLOAD_LINK_CACHE_VARIABLE, serialized) {
+            error!("Unable to cache pCloud download links: {:?}", cache_error);
+        }
     }
 }
 
+fn cached_download_link(cache_key: &str) -> Option<PCloudLinkResult> {
+    let mut cache = load_download_link_cache();
+    let link = cache.get(cache_key, OffsetDateTime::now_utc());
+    save_download_link_cache(&cache);
+    link
+}
+
 fn cache_download_link(cache_key: &str, link: &PCloudLinkResult) {
-    if let Ok(serialized) = serde_json::to_string(link) {
-        if let Err(cache_error) = var::set(cache_key, serialized) {
-            error!("Unable to cache pCloud download link: {:?}", cache_error);
-        }
-    }
+    let mut cache = load_download_link_cache();
+    cache.insert(cache_key.to_string(), link.clone(), OffsetDateTime::now_utc());
+    save_download_link_cache(&cache);
 }
 
 pub fn settings_from_value(value: Value)-> FnResult<PCloudSettings> {
@@ -409,5 +473,29 @@ mod tests {
 
         link.expires = now + Duration::seconds(60);
         assert!(!download_link_is_reusable(&link, now));
+    }
+
+    #[test]
+    fn download_link_cache_sweeps_expired_entries_and_evicts_lru() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let link = |expires| PCloudLinkResult {
+            result: 0,
+            path: "/download".to_string(),
+            expires,
+            hosts: vec!["example.test".to_string()],
+        };
+        let mut cache = DownloadLinkCache::default();
+        cache.insert("expired".to_string(), link(now + Duration::seconds(30)), now);
+        for index in 0..DOWNLOAD_LINK_CACHE_CAPACITY {
+            cache.insert(index.to_string(), link(now + Duration::hours(1)), now);
+        }
+        assert_eq!(cache.entries.len(), DOWNLOAD_LINK_CACHE_CAPACITY);
+        assert!(cache.entries.iter().all(|entry| entry.key != "expired"));
+
+        assert!(cache.get("0", now).is_some());
+        cache.insert("new".to_string(), link(now + Duration::hours(1)), now);
+        assert_eq!(cache.entries.len(), DOWNLOAD_LINK_CACHE_CAPACITY);
+        assert!(cache.entries.iter().any(|entry| entry.key == "0"));
+        assert!(cache.entries.iter().all(|entry| entry.key != "1"));
     }
 }

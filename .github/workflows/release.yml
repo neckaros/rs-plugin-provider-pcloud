@@ -18,7 +18,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-wasip1
 
       - name: Get current version
         id: current_version
@@ -43,7 +43,7 @@ jobs:
 
       - name: Build WASM
         if: steps.version_check.outputs.changed == 'true'
-        run: cargo build --release --target wasm32-unknown-unknown
+        run: cargo build --release --target wasm32-wasip1
 
       - name: Create GitHub Release
         if: steps.version_check.outputs.changed == 'true'
@@ -53,7 +53,7 @@ jobs:
           name: Release v${{ steps.current_version.outputs.version }}
           body: |
             Production release of WASM plugin.
-            Built with stable Rust for target wasm32-unknown-unknown.
-          files: target/wasm32-unknown-unknown/release/rs_plugin_provider_pcloud.wasm
+            Built with stable Rust for target wasm32-wasip1.
+          files: target/wasm32-wasip1/release/rs_plugin_provider_pcloud.wasm
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
